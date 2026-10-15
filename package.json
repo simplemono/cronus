@@ -7,7 +7,8 @@
     "test:unit": "npm run build && node --test \"dist/unit/*.mjs\"",
     "test:worker": "npm run build && vitest run",
     "deploy": "npm run build && wrangler deploy",
-    "dev": "npm run build && wrangler dev --test-scheduled"
+    "dev": "npm run build && wrangler dev --test-scheduled",
+    "prepare": "npm run build"
   },
   "keywords": [],
   "author": "",
@@ -20,5 +21,17 @@
     "wrangler": "^4.151.0"
   },
   "type": "module",
-  "private": true
+  "private": true,
+  "exports": {
+    "./worker": "./dist/cronus/worker.mjs",
+    "./cron": "./dist/cronus/cron.mjs",
+    "./schema.sql": "./schema.sql",
+    "./wrangler.toml": "./wrangler.toml"
+  },
+  "files": [
+    "dist",
+    "schema.sql",
+    "wrangler.toml",
+    "src"
+  ]
 }
