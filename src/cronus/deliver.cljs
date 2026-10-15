@@ -1,14 +1,15 @@
 (ns cronus.deliver
-  "One firing of a job: the claim, the HTTP call with the idempotency
-  headers, the verdict (ok, retry, fail), and the attempt row with the
-  job's new state, written together.
+  "The two halves of a firing. The minute (`tick!`) claims every due job
+  and puts one message per job on the queue; the consumer (`deliver!`)
+  makes the call and records the outcome. They share only the job row.
 
-  At least once: a firing is attempted until the target answers 2xx, up
-  to the job's `attempts`, one attempt per minute. A network error, a
-  timeout, a 5xx and a 429 are retried; any other status, a redirect
-  among them, ends the firing as failed at once. A firing that is more
-  than an hour overdue is skipped, so a long outage does not replay a
-  day of runs."
+  Every call is a POST with the JSON body `{job, scheduled, attempt}`;
+  the URL is the job's credential. At least once: a firing is attempted
+  until the target answers 2xx, up to the job's `attempts`, one attempt
+  per minute. A network error, a timeout, a 5xx and a 429 are retried;
+  any other status, a redirect among them, ends the firing as failed at
+  once. A firing that is more than an hour overdue is skipped, so a
+  long outage does not replay a day of runs."
   (:require [cronus.cron :as cron]
             [cronus.store :as store]))
 
@@ -22,9 +23,13 @@
   65536)
 
 (def lease-margin-ms
-  "A lease lasts the job's timeout plus this, for the writes after the
-  call."
-  15000)
+  "A lease lasts the job's timeout plus this: the wait in the queue and
+  the writes after the call."
+  60000)
+
+(def send-batch-size
+  "Messages per `sendBatch`, the queue's maximum."
+  100)
 
 (defn verdict
   "`:ok`, `:retry` or `:fail` for a status (nil = no answer)."
@@ -40,27 +45,16 @@
   (.toISOString (js/Date. millis)))
 
 (defn request-of
-  "The Request for one attempt: the job's method, headers and body plus
-  `X-Cronus-Job`, `X-Cronus-Scheduled` and `X-Cronus-Attempt`; without a
-  body of its own the job sends those three as JSON. Redirects are not
-  followed: a 3xx is an answer like any other."
-  [{:keys [id url method headers_json body]} scheduled attempt signal]
-  (let [headers (js/Headers. (js/JSON.parse (or headers_json "{}")))
-        method (or method "POST")
-        with-body? (not (contains? #{"GET" "HEAD"} method))]
-    (.set headers "X-Cronus-Job" id)
-    (.set headers "X-Cronus-Scheduled" (iso scheduled))
-    (.set headers "X-Cronus-Attempt" (str attempt))
-    (when (and with-body? (nil? body) (not (.has headers "content-type")))
-      (.set headers "content-type" "application/json"))
-    (js/Request. url {:method method
-                      :headers headers
-                      :redirect "manual"
-                      :body (when with-body?
-                              (if (nil? body)
-                                (js/JSON.stringify {:job id :scheduled (iso scheduled) :attempt attempt})
-                                body))
-                      :signal signal})))
+  "The Request of one attempt: a POST to the job's URL with the JSON
+  body `{job, scheduled, attempt}`, which the target can use to be
+  idempotent. Redirects are not followed: a 3xx is an answer like any
+  other, so the URL, the credential, never travels on."
+  [{:keys [id url]} scheduled attempt signal]
+  (js/Request. url {:method "POST"
+                    :headers {"content-type" "application/json"}
+                    :redirect "manual"
+                    :body (js/JSON.stringify {:job id :scheduled (iso scheduled) :attempt attempt})
+                    :signal signal}))
 
 (defn ^:async read-head
   "Up to `answer-limit` bytes of the response body as text; the rest is
@@ -85,8 +79,8 @@
 
 (defn ^:async attempt!
   "Performs one attempt; answers `{:status :ok? :duration_ms :answer :verdict}`.
-  A request that cannot even be built (a stored URL or header that the
-  runtime refuses) fails without a retry."
+  A request that cannot even be built (a stored URL the runtime
+  refuses) fails without a retry."
   [job scheduled attempt]
   (let [controller (js/AbortController.)
         timer (js/setTimeout #(.abort controller) (or (:timeout_ms job) 30000))
@@ -113,68 +107,72 @@
   [{:keys [cron tz]} millis]
   (cron/next-run-of cron tz millis))
 
-(defn ^:async fire!
-  "The due firing of the job at `now` (the minute): the claim, the
-  attempt that is next (a first one, or the retry waiting), and its row
-  with the job's new state. Answers the attempt result, `{:skipped true}`
-  for a scheduled time too old, or `{:claimed false}` when another
-  minute holds the job or the row changed since it was read."
-  [db job now]
-  (let [{:keys [id attempts pending_scheduled pending_attempt next_run failures updated timeout_ms]} job
-        retrying? (some? pending_scheduled)
-        scheduled (if retrying? pending_scheduled next_run)
-        attempt (if retrying? (inc (or pending_attempt 0)) 1)
-        wall-now (js/Date.now)
-        version (js-await (store/claim! db id updated (+ wall-now (or timeout_ms 30000) lease-margin-ms) wall-now))]
-    (cond
-      (nil? version)
-      {:claimed false}
-
-      (and (not retrying?) (> (- now scheduled) catch-up-ms))
-      (do (js-await (store/finish! db {:job_id id :version version :now (js/Date.now)
-                                       :attempt {:scheduled scheduled :attempt 0 :mode "skipped" :at now :status nil
-                                                 :duration_ms 0 :answer "skipped: more than an hour overdue" :ok false}
-                                       :fields {"next_run" (next-after job now)}}))
-          {:skipped true})
-
-      :else
-      (let [{:keys [status ok? duration_ms answer verdict] :as result} (js-await (attempt! job scheduled attempt))
-            final-failure? (or (= verdict :fail) (and (= verdict :retry) (>= attempt (or attempts 3))))
-            fields (cond
-                     ok? {"pending_scheduled" nil "pending_attempt" 0 "failures" 0
-                          "last_run" now "last_status" "ok"}
-                     final-failure? {"pending_scheduled" nil "pending_attempt" 0 "failures" (inc (or failures 0))
-                                     "last_run" now "last_status" "failed"}
-                     :else {"pending_scheduled" scheduled "pending_attempt" attempt "last_status" "retrying"})
-            fields (if (or ok? final-failure?)
-                     (assoc fields "next_run" (next-after job (max scheduled now)))
-                     fields)]
-        (js-await (store/finish! db {:job_id id :version version :now (js/Date.now)
-                                     :attempt {:scheduled scheduled :attempt attempt :mode "scheduled" :at now
-                                               :status status :duration_ms duration_ms :answer answer :ok ok?}
-                                     :fields fields}))
-        result))))
-
-(defn ^:async run-all!
-  "Runs the thunks (each answering a promise) with at most `limit` in
-  flight; answers when all are done."
-  [thunks limit]
-  (let [queue (vec thunks)
-        cursor #js {:i 0}
-        worker (fn ^:async worker []
-                 (loop []
-                   (let [i (.-i cursor)]
-                     (when (< i (.-length queue))
-                       (set! (.-i cursor) (inc i))
-                       (try (js-await ((aget queue i)))
-                            (catch :default e (js/console.error "cronus: a firing threw" (or (.-message e) e))))
-                       (recur)))))]
-    (js-await (js/Promise.all (mapv (fn [_] (worker)) (range (min limit (.-length queue))))))
-    nil))
-
 (defn ^:async tick!
-  "The minute: every due job fired, six at a time."
-  [db now]
-  (let [jobs (js-await (store/due-jobs db now (js/Date.now)))]
-    (js-await (run-all! (mapv (fn [job] (fn [] (fire! db job now))) jobs) 6))
-    (count jobs)))
+  "The minute: every due job claimed (lease, attempt, version) and put
+  on the queue as `{id, version, minute}`; answers how many. A job
+  another minute holds, or whose row changed since it was read, is left
+  alone."
+  [db queue now]
+  (let [jobs (js-await (store/due-jobs db now (js/Date.now)))
+        messages #js []]
+    (doseq [job jobs]
+      (let [wall-now (js/Date.now)
+            lease-until (+ wall-now (or (:timeout_ms job) 30000) lease-margin-ms)
+            version (js-await (store/claim! db (:id job) (:version job) lease-until wall-now))]
+        (when (some? version)
+          (.push messages {:body {:id (:id job) :version version :minute now}}))))
+    (loop [i 0]
+      (when (< i (.-length messages))
+        (js-await (.sendBatch queue (.slice messages i (+ i send-batch-size))))
+        (recur (+ i send-batch-size))))
+    (.-length messages)))
+
+(defn ^:async deliver!
+  "One message from the queue. The job is read again: a version other
+  than the claim's, or no lease, means the message is stale (the lease
+  expired and a later minute claimed again, a PUT replaced the job, or
+  the outcome is already written) and nothing happens. Otherwise a
+  first attempt more than an hour overdue is skipped; an attempt beyond
+  the budget fails without a call, since the earlier outcomes were
+  never written; else the call is made and the outcome written. Answers
+  what happened as a keyword."
+  [db {:keys [id version minute]}]
+  (let [job (js-await (store/get-job db id))]
+    (cond
+      (nil? job) :gone
+      (or (not= (:version job) version) (nil? (:lease_until job))) :stale
+      :else
+      (let [{:keys [attempts pending_scheduled pending_attempt failures]} job
+            scheduled pending_scheduled
+            attempt pending_attempt
+            budget (or attempts 3)
+            done! (fn [fields]
+                    (store/finish! db {:job_id id :version version :now (js/Date.now) :fields fields}))]
+        (cond
+          (and (= attempt 1) (> (- minute scheduled) catch-up-ms))
+          (do (js-await (done! {"pending_scheduled" nil "pending_attempt" 0 "next_run" (next-after job minute)
+                                "last_status" "skipped" "last_http_status" nil "last_duration_ms" 0
+                                "last_answer" (str "skipped: " (iso scheduled) " was more than an hour overdue")}))
+              :skipped)
+
+          (> attempt budget)
+          (do (js-await (done! {"pending_scheduled" nil "pending_attempt" 0 "failures" (inc (or failures 0))
+                                "last_run" minute "last_status" "failed" "last_http_status" nil "last_duration_ms" 0
+                                "last_answer" "no attempts left; an earlier outcome was never written"
+                                "next_run" (next-after job (max scheduled minute))}))
+              :failed)
+
+          :else
+          (let [{:keys [status ok? duration_ms answer verdict]} (js-await (attempt! job scheduled attempt))
+                final-failure? (or (= verdict :fail) (and (= verdict :retry) (>= attempt budget)))
+                fields (cond
+                         ok? {"pending_scheduled" nil "pending_attempt" 0 "failures" 0
+                              "last_run" minute "last_status" "ok"
+                              "next_run" (next-after job (max scheduled minute))}
+                         final-failure? {"pending_scheduled" nil "pending_attempt" 0 "failures" (inc (or failures 0))
+                                         "last_run" minute "last_status" "failed"
+                                         "next_run" (next-after job (max scheduled minute))}
+                         :else {"last_status" "retrying"})
+                fields (assoc fields "last_http_status" status "last_duration_ms" duration_ms "last_answer" answer)]
+            (js-await (done! fields))
+            (cond ok? :ok final-failure? :failed :else :retrying)))))))

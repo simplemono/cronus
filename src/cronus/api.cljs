@@ -1,15 +1,16 @@
 (ns cronus.api
   "The management API, behind one bearer secret (`CRONUS_SECRET`):
 
-      PUT    /jobs/<id>          {cron tz url method headers body timeout_ms attempts}
-      GET    /jobs/<id>          the job, its next run and its last attempts
+      PUT    /jobs/<id>          {cron tz url timeout_ms attempts}
+      GET    /jobs/<id>          the job, its next run and its last attempt
       GET    /jobs?prefix=&limit=&after=
       DELETE /jobs/<id>
       GET    /health             no secret needed
 
   Ids are opaque strings, URL-encoded in the path. JSON in, JSON out.
-  A paused job is a deleted one; a manual run is a call to the job's
-  URL by whoever holds its headers."
+  Every firing is a POST to the job's URL with a JSON body; the URL is
+  the credential. A paused job is a deleted one; a manual run is a call
+  to the URL by whoever knows it."
   (:require [clojure.string :as str]
             [cronus.cron :as cron]
             [cronus.store :as store]))
@@ -46,43 +47,40 @@
       (js-await (same-secret? (.slice header 7) secret))
       false)))
 
-(def ^:private methods #{"GET" "POST" "PUT" "PATCH" "DELETE"})
-
-(def body-limit "Bytes of a job's body." 65536)
-(def headers-limit "Bytes of a job's headers as JSON." 4096)
 (def url-limit 2048)
 
-(defn- iso [millis]
-  (when (some? millis) (.toISOString (js/Date. millis))))
+(defn- or-null
+  "The value, or null (not undefined, which JSON would drop)."
+  [v]
+  (if (some? v) v nil))
+
+(defn- iso
+  "An ISO string, or null."
+  [millis]
+  (if (some? millis) (.toISOString (js/Date. millis)) nil))
 
 (defn- present
-  "A job row as the API shows it: times as ISO strings, headers parsed."
-  [row attempts]
+  "A job row as the API shows it: times as ISO strings or null, the last
+  attempt as `last_*`."
+  [row]
   {:id (:id row)
    :cron (:cron row)
    :tz (:tz row)
    :url (:url row)
-   :method (:method row)
-   :headers (js/JSON.parse (or (:headers_json row) "{}"))
-   :body (:body row)
    :timeout_ms (:timeout_ms row)
    :attempts (:attempts row)
    :next_run (iso (:next_run row))
-   :pending (when (some? (:pending_scheduled row))
-              {:scheduled (iso (:pending_scheduled row)) :attempts_done (:pending_attempt row)})
+   :pending (if (some? (:pending_scheduled row))
+              {:scheduled (iso (:pending_scheduled row)) :attempt (:pending_attempt row)}
+              nil)
    :last_run (iso (:last_run row))
-   :last_status (:last_status row)
+   :last_status (or-null (:last_status row))
+   :last_http_status (or-null (:last_http_status row))
+   :last_duration_ms (or-null (:last_duration_ms row))
+   :last_answer (or-null (:last_answer row))
    :failures (:failures row)
    :created (iso (:created row))
-   :updated (iso (:updated row))
-   :recent_attempts (when attempts
-                      (mapv (fn [a] {:scheduled (iso (:scheduled a)) :attempt (:attempt a) :mode (:mode a)
-                                    :at (iso (:at a)) :status (:status a) :duration_ms (:duration_ms a)
-                                    :answer (:answer a) :ok (= 1 (:ok a))})
-                           attempts))})
-
-(defn- byte-length [text]
-  (.-byteLength (.encode (js/TextEncoder.) (str text))))
+   :updated (iso (:updated row))})
 
 (defn- usable-url?
   "A parseable http(s) URL."
@@ -92,41 +90,24 @@
        (try (contains? #{"http:" "https:"} (.-protocol (js/URL. url)))
             (catch :default _ false))))
 
-(defn- usable-headers?
-  "An object of strings the runtime accepts as header names and values."
-  [headers]
-  (and (object? headers)
-       (every? string? (vals headers))
-       (try (js/Headers. headers) true
-            (catch :default _ false))))
-
 (defn- integer-between? [n lo hi]
   (and (number? n) (js/Number.isInteger n) (>= n lo) (<= n hi)))
 
 (defn validate
   "The job definition from the request body as `{:job ...}`, or
-  `{:error message}` with an optional `:status` (413 for a size)."
+  `{:error message}`."
   [id body now]
   (let [cron-text (:cron body)
         tz (or (:tz body) "UTC")
         url (:url body)
-        method (str/upper-case (or (:method body) "POST"))
-        headers (or (:headers body) {})
-        job-body (:body body)
         timeout (or (:timeout_ms body) 30000)
-        attempts (or (:attempts body) 3)
-        body-text (cond (nil? job-body) nil (string? job-body) job-body :else (js/JSON.stringify job-body))]
+        attempts (or (:attempts body) 3)]
     (cond
       (not (string? cron-text)) {:error "cron is required, five fields like \"0 9 * * 1-5\"."}
       (not (cron/five-fields? cron-text)) {:error "cron has five fields, minute hour day month weekday, or a shortcut like @daily."}
       (not (string? tz)) {:error "tz must be an IANA time zone name like Europe/Berlin."}
       (not (cron/valid-zone? tz)) {:error (str "tz \"" tz "\" is not a known time zone; use an IANA name like Europe/Berlin.")}
       (not (usable-url? url)) {:error "url must be a valid http:// or https:// URL."}
-      (not (contains? methods method)) {:error "method must be GET, POST, PUT, PATCH or DELETE."}
-      (not (usable-headers? headers)) {:error "headers must be an object of strings with usable header names and values."}
-      (> (byte-length (js/JSON.stringify headers)) headers-limit) {:error "headers are limited to 4 KB." :status 413}
-      (not (or (nil? job-body) (string? job-body) (object? job-body))) {:error "body must be a string, an object or absent."}
-      (and (some? body-text) (> (byte-length body-text) body-limit)) {:error "body is limited to 64 KB." :status 413}
       (not (integer-between? timeout 1000 300000)) {:error "timeout_ms must be a whole number between 1000 and 300000."}
       (not (integer-between? attempts 1 10)) {:error "attempts must be a whole number between 1 and 10."}
       :else
@@ -136,9 +117,7 @@
           (let [next-run (cron/next-run (:pattern parsed) now)]
             (if (nil? next-run)
               {:error "cron never matches."}
-              {:job {:id id :cron (str/trim cron-text) :tz tz :url url :method method
-                     :headers_json (js/JSON.stringify headers)
-                     :body body-text
+              {:job {:id id :cron (str/trim cron-text) :tz tz :url url
                      :timeout_ms timeout :attempts attempts :next_run next-run :now now}})))))))
 
 (def ^:private id-pattern
@@ -178,14 +157,17 @@
       (let [[_ segment action] parts
             id (when segment (job-id segment))]
         (cond
+          (and (nil? segment) (not= method "GET"))
+          (error 405 "The collection answers GET only; a job is created with PUT /jobs/<id>.")
+
           ;; GET /jobs?prefix=
-          (and (nil? segment) (= method "GET"))
+          (nil? segment)
           (let [params (.-searchParams url)
                 prefix (or (.get params "prefix") "")
                 limit (limit-of params)
                 after (.get params "after")
                 rows (js-await (store/list-jobs db prefix limit after))]
-            (json 200 {:jobs (mapv #(present % nil) rows)
+            (json 200 {:jobs (mapv present rows)
                        :next_after (when (= (count rows) limit) (:id (last rows)))}))
 
           (nil? id)
@@ -198,17 +180,17 @@
           (let [body (try (js-await (.json req)) (catch :default _ nil))]
             (if (not (object? body))
               (error 400 "The body must be a JSON object.")
-              (let [{:keys [error status job]} (validate id body now)]
+              (let [{:keys [error job]} (validate id body now)]
                 (if error
-                  (json (or status 400) {:error error})
+                  (json 400 {:error error})
                   (do (js-await (store/put-job! db job))
-                      (json 200 (present (js-await (store/get-job db id)) nil)))))))
+                      (json 200 (present (js-await (store/get-job db id)))))))))
 
           (= method "GET")
           (let [row (js-await (store/get-job db id))]
             (if (nil? row)
               (error 404 "No such job.")
-              (json 200 (present row (js-await (store/attempts-of db id))))))
+              (json 200 (present row))))
 
           (= method "DELETE")
           (if (js-await (store/delete-job! db id))

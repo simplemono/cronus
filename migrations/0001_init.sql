@@ -1,16 +1,16 @@
--- cronus: the jobs and their last attempts. Applied with
+-- cronus: the jobs, each with its last attempt. Applied with
 -- `wrangler d1 migrations apply <database>` (see package.json), locally
--- with `--local`, and in the tests through applyD1Migrations.
+-- with `--local`, and in the tests through applyD1Migrations. A later
+-- migration must keep the previous Worker working: `npm run deploy`
+-- migrates before it deploys.
 CREATE TABLE jobs (
   id TEXT PRIMARY KEY,
   cron TEXT NOT NULL,
   tz TEXT NOT NULL DEFAULT 'UTC',
   url TEXT NOT NULL,
-  method TEXT NOT NULL DEFAULT 'POST',
-  headers_json TEXT NOT NULL DEFAULT '{}',
-  body TEXT,
   timeout_ms INTEGER NOT NULL DEFAULT 30000,
   attempts INTEGER NOT NULL DEFAULT 3,
+  version INTEGER NOT NULL DEFAULT 1,
   next_run INTEGER,
   pending_scheduled INTEGER,
   pending_attempt INTEGER NOT NULL DEFAULT 0,
@@ -19,20 +19,10 @@ CREATE TABLE jobs (
   updated INTEGER NOT NULL,
   last_run INTEGER,
   last_status TEXT,
+  last_http_status INTEGER,
+  last_duration_ms INTEGER,
+  last_answer TEXT,
   failures INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX jobs_due ON jobs (next_run);
 CREATE INDEX jobs_pending ON jobs (pending_scheduled);
-
-CREATE TABLE attempts (
-  job_id TEXT NOT NULL,
-  scheduled INTEGER NOT NULL,
-  attempt INTEGER NOT NULL,
-  mode TEXT NOT NULL,
-  at INTEGER NOT NULL,
-  status INTEGER,
-  duration_ms INTEGER NOT NULL,
-  answer TEXT,
-  ok INTEGER NOT NULL
-);
-CREATE INDEX attempts_by_job ON attempts (job_id, at);
