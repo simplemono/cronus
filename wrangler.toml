@@ -1,9 +1,10 @@
 # cronus: a cron scheduler on Cloudflare Workers. Copy this file into your
-# own deployment (or use it as is), create the D1 database and set the
-# secret:
+# own deployment (or use it as is), create the D1 database and the queue
+# and set the secret:
 #   npx wrangler d1 create cronus          # put the id below
+#   npx wrangler queues create cronus      # the calls are made from this queue
 #   npx wrangler secret put CRONUS_SECRET  # the bearer token of the API
-#   npm run build && npx wrangler deploy
+#   npm run deploy                         # migrations, then the Worker
 name = "cronus"
 main = "dist/cronus/worker.mjs"
 compatibility_date = "2026-09-01"
@@ -15,6 +16,19 @@ crons = ["* * * * *"]
 binding = "DB"
 database_name = "cronus"
 database_id = "replace-with-the-id-wrangler-d1-create-prints"
+migrations_dir = "migrations"
+
+# The minute puts one message per due job here; the consumer, this same
+# Worker, makes the call. One message per invocation, so a slow target
+# delays nothing but itself; a consumer that dies gets the message again.
+[[queues.producers]]
+binding = "QUEUE"
+queue = "cronus"
+
+[[queues.consumers]]
+queue = "cronus"
+max_batch_size = 1
+max_retries = 2
 
 [observability]
 enabled = true
