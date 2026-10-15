@@ -16,7 +16,6 @@
   "description": "A cron scheduler on Cloudflare Workers that calls your URLs on time, written in Squint.",
   "devDependencies": {
     "@cloudflare/vitest-plugin": "^1.4.2",
-    "squint-cljs": "^0.15.212",
     "vitest": "^4.1.0",
     "wrangler": "^4.151.0"
   },
@@ -33,5 +32,8 @@
     "schema.sql",
     "wrangler.toml",
     "src"
-  ]
+  ],
+  "dependencies": {
+    "squint-cljs": "^0.15.212"
+  }
 }
