@@ -3,7 +3,7 @@
 # secret:
 #   npx wrangler d1 create cronus          # put the id below
 #   npx wrangler secret put CRONUS_SECRET  # the bearer token of the API
-#   npm run build && npx wrangler deploy
+#   npm run deploy                         # migrations, then the Worker
 name = "cronus"
 main = "dist/cronus/worker.mjs"
 compatibility_date = "2026-09-01"
@@ -15,6 +15,7 @@ crons = ["* * * * *"]
 binding = "DB"
 database_name = "cronus"
 database_id = "replace-with-the-id-wrangler-d1-create-prints"
+migrations_dir = "migrations"
 
 [observability]
 enabled = true

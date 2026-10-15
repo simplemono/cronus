@@ -1,13 +1,14 @@
 {
   "name": "cronus",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "scripts": {
-    "build": "squint compile && node scripts/embed-schema.mjs",
+    "build": "squint compile",
     "test": "npm run build && node --test \"dist/unit/*.mjs\" && vitest run",
     "test:unit": "npm run build && node --test \"dist/unit/*.mjs\"",
     "test:worker": "npm run build && vitest run",
-    "deploy": "npm run build && wrangler deploy",
-    "dev": "npm run build && wrangler dev --test-scheduled",
+    "migrate": "wrangler d1 migrations apply cronus --remote",
+    "deploy": "npm run build && npm run migrate && wrangler deploy",
+    "dev": "npm run build && wrangler d1 migrations apply cronus --local && wrangler dev --test-scheduled",
     "prepare": "npm run build"
   },
   "keywords": [],
@@ -24,16 +25,16 @@
   "exports": {
     "./worker": "./dist/cronus/worker.mjs",
     "./cron": "./dist/cronus/cron.mjs",
-    "./schema.sql": "./schema.sql",
     "./wrangler.toml": "./wrangler.toml"
   },
   "files": [
     "dist",
-    "schema.sql",
+    "migrations",
     "wrangler.toml",
     "src"
   ],
   "dependencies": {
+    "croner": "^10.0.1",
     "squint-cljs": "^0.15.212"
   }
 }
