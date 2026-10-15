@@ -1,0 +1,24 @@
+{
+  "name": "cronus",
+  "version": "0.1.0",
+  "scripts": {
+    "build": "squint compile && node scripts/embed-schema.mjs",
+    "test": "npm run build && node --test \"dist/unit/*.mjs\" && vitest run",
+    "test:unit": "npm run build && node --test \"dist/unit/*.mjs\"",
+    "test:worker": "npm run build && vitest run",
+    "deploy": "npm run build && wrangler deploy",
+    "dev": "npm run build && wrangler dev --test-scheduled"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "description": "A cron scheduler on Cloudflare Workers that calls your URLs on time, written in Squint.",
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.4.2",
+    "squint-cljs": "^0.15.212",
+    "vitest": "^4.1.0",
+    "wrangler": "^4.151.0"
+  },
+  "type": "module",
+  "private": true
+}
